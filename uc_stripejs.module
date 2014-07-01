@@ -1,0 +1,225 @@
+<?php
+
+define('stripe_sk', 'STRIPE_SECRET_KEY');
+define('stripe_pk', 'STRIPE_PUBLIC_KEY');
+
+drupal_add_js('https://js.stripe.com/v2/');
+drupal_add_js(array('stripe_js_pk' => stripe_pk), 'setting');
+drupal_add_js(drupal_get_path('module', 'uc_stripejs') . '/uc_stripejs.js');
+
+/**
+ * Implements hook_uc_payment_method().
+ */
+function uc_stripejs_uc_payment_method() {
+    $title1 = t('Credit/Debit card payments via Stripe.');
+
+    $cc_types = array(
+        'visa' => t('Visa'),
+        'mastercard' => t('MasterCard'),
+        'discover' => t('Discover'),
+        'amex' => t('American Express'),
+        'echeck' => t('eCheck'),
+    );
+
+    $methods[] = array(
+        'id' => 'stripe_js',
+        'name' => t('StripeJS Payments'),
+        'title' => $title1,
+        'review' => t('Credit / Debit Card'),
+        'desc' => t('Takes credit card payments via StripeJS.'),
+        'callback' => 'uc_stripejs_uc_payment_method_callback',
+        'credit' => 'uc_stripejs_charge',
+        'weight' => 1,
+        'checkout' => FALSE,
+        'no_gateway' => TRUE,
+    );
+
+    return $methods;
+}
+
+/**
+ * Implements hook_uc_payment_method().
+ */
+function uc_stripejs_uc_payment_method_callback($op, &$order, $form = NULL, &$form_state = NULL) {
+    switch($op){
+        case 'cart-details':
+            $details = uc_stripejs_method_credit_form(array(), $form_state, $order);
+
+            return $details;
+            break;
+        case 'cart-process':
+            // Fetch the CC details from the $_POST directly.
+            $cc_data = $form_state['values']['panes']['payment']['details'];
+
+            // Go ahead and put the CC data in the payment details array.
+            $order->payment_details = $cc_data;
+
+            $return = TRUE;
+            // Validate that a StripeToken has been set
+            if (empty($cc_data['stripeToken'])) {
+                form_set_error('panes][payment][details][cc_number', t('You have entered an invalid credit card number.'));
+                $return = FALSE;
+            }
+
+            // Initialize the encryption key and class.
+            $key = uc_credit_encryption_key();
+            $crypt = new UbercartEncryption();
+
+            // Store the encrypted details in the session for the next pageload.
+            // We are using base64_encode() because the encrypt function works with a
+            // limited set of characters, not supporting the full Unicode character
+            // set or even extended ASCII characters that may be present.
+            // base64_encode() converts everything to a subset of ASCII, ensuring that
+            // the encryption algorithm does not mangle names.
+            $_SESSION['sescrd'] = $crypt->encrypt($key, base64_encode(serialize($order->payment_details)));
+
+            // Log any errors to the watchdog.
+            uc_store_encryption_errors($crypt, 'uc_credit');
+
+            // If we're going to the review screen, set a variable that lets us know
+            // we're paying by CC.
+            if ($return) {
+                $_SESSION['stripe_pay'] = TRUE;
+            }
+
+            return $return;
+            break;
+    }
+}
+
+function uc_stripejs_method_credit_form($form, &$form_state, $order){
+
+    if (!isset($order->payment_details)) {
+        $order->payment_details = array();
+    }
+
+    $form['cc_policy'] = array(
+        '#markup' => '<p>' . variable_get('uc_credit_policy', t('Your billing information must match the billing address for the credit card entered below or we will be unable to process your payment.')) . '</p>'
+    );
+
+    $form['cc_error'] = array(
+        '#markup' => '<div class="messages error stripe-error-message" style="display: none;"><span class="message"></span></div>'
+    );
+
+    $form['cc_number'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Card number'),
+        '#attributes' => array('autocomplete' => 'off', 'data-stripe' =>  'number'),
+        '#size' => 20,
+        '#maxlength' => 19,
+        '#name' => ''
+    );
+
+    /**
+     * Expiration Date
+     */
+    $form['cc_exp_month'] = uc_select_month(t('Expiration date'), 1) + array('#name' => '', '#attributes' => array('data-stripe' => 'exp-month'));
+    $form['cc_exp_year']  = uc_select_year(t('Expiration year'), date('Y')) + array('#name' => '', '#attributes' => array('data-stripe' => 'exp-year'));
+
+    if (variable_get('uc_credit_cvv_enabled', TRUE)) {
+        $form['cc_cvv'] = array(
+            '#type' => 'textfield',
+            '#title' => t('CVV'),
+            '#default_value' => NULL,
+            '#attributes' => array('autocomplete' => 'off', 'data-stripe' => 'cvc'),
+            '#size' => variable_get('uc_credit_amex', TRUE) ? 4 : 3,
+            '#maxlength' => variable_get('uc_credit_amex', TRUE) ? 4 : 3,
+            '#field_suffix' => theme('uc_credit_cvv_help'),
+            '#name' => ''
+        );
+    }
+
+    $form['stripeToken'] = array(
+        '#type' => 'hidden',
+        '#size' => 20,
+        '#maxlength' => 19,
+    );
+
+    unset($_SESSION['clear_cc']);
+
+    return $form;
+}
+
+/**
+ * Implements hook_uc_order().
+ */
+function uc_stripejs_uc_order($op, $order, $arg2) {
+    // Set up the encryption key and object for saving and loading.
+    if (isset($order->payment_method) && $order->payment_method == 'stripe_js' && ($op == 'save' || $op == 'load')) {
+        // Log an error if encryption isn't configured properly.
+        if (!uc_credit_encryption_key()) {
+            watchdog('uc_credit', 'Credit card encryption must be set up to process credit cards.');
+        }
+    }
+
+    switch ($op) {
+        case 'submit':
+            if (isset($order->payment_method) && $order->payment_method == 'stripe_js') {
+                require_once 'sites/all/libraries/stripe/lib/Stripe.php';
+                Stripe::setApiKey(stripe_sk);
+
+                // Clear out that session variable denoting this as a CC paid order.
+                unset($_SESSION['cc_pay']);
+
+                // Process CC transactions when an order is submitted after review.
+                $gateway_id = uc_credit_default_gateway();
+                $data = array(
+                    'txn_type' => variable_get('uc_pg_' . $gateway_id . '_cc_txn_type', UC_CREDIT_AUTH_CAPTURE),
+                );
+
+                // Attempt to process the CC payment.
+                $order->payment_details = uc_credit_cache('load');
+                $total = $order->order_total * 100;
+                if($total / 100 != $order->order_total){
+                    return false;
+                }
+
+                /**
+                 * Process the payment here
+                 */
+                $pass = true;
+                $stripeToken = $order->payment_details['stripeToken'];
+
+                try {
+                    Stripe_Charge::create(
+                        array(
+                            "amount" => $total,
+                            "currency" => "gbp",
+                            "card" => $stripeToken
+                        )
+                    );
+                }
+                catch (Exception $e) {
+                    $pass = false;
+                }
+
+                // If the payment failed, store the data back in the session and
+                // halt the checkout process.
+                if (!$pass) {
+                    $message = variable_get('uc_credit_fail_message', t('We were unable to process your credit card payment. Please verify your details and try again.  If the problem persists, contact us to complete your order.'));
+                    return array(array('pass' => FALSE, 'message' => $message));
+                }
+
+                return true;
+            }
+            break;
+
+        case 'save':
+            if (isset($order->payment_method) && $order->payment_method == 'credit' && !empty($order->payment_details)) {
+                _uc_credit_save_cc_data_to_order($order->payment_details, $order->order_id);
+            }
+            break;
+
+        case 'load':
+            if (isset($order->payment_method) && $order->payment_method == 'credit') {
+                // Load the CC details from the credit cache if available.
+                $order->payment_details = uc_credit_cache('load');
+
+                // Otherwise load any details that might be stored in the data array.
+                if (empty($order->payment_details) && isset($order->data['cc_data'])) {
+                    $order->payment_details = uc_credit_cache('save', $order->data['cc_data']);
+                }
+            }
+            break;
+    }
+}
